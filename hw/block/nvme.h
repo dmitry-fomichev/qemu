@@ -32,6 +32,8 @@ typedef struct NvmeParams {
     uint32_t    fzr_delay;
     uint32_t    frl;
     uint32_t    zd_extension_size;
+    uint32_t    nr_offline_zones;
+    uint32_t    nr_rdonly_zones;
 } NvmeParams;
 
 typedef struct NvmeAsyncEvent {
