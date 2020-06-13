@@ -3,6 +3,7 @@
 
 #include "block/nvme.h"
 
+#define NVME_MAX_ASYNC_EVENTS    16
 #define NVME_DEFAULT_ZONE_SIZE   128 /* MiB */
 #define NVME_DEFAULT_MAX_ZA_SIZE 128 /* KiB */
 
@@ -19,6 +20,7 @@ typedef struct NvmeParams {
     bool        zoned;
     bool        cross_zone_read;
     char        *zone_file;
+    bool        zone_async_events;
     bool        active_excursions;
     uint8_t     fill_pattern;
     uint32_t    zasl_kb;
@@ -88,6 +90,7 @@ enum NvmeZoneFlags {
     NVME_ZFLAGS_TS_DELAY = 1 << 0,
     NVME_ZFLAGS_SET_RZR  = 1 << 1,
     NVME_ZFLAGS_SET_FZR  = 1 << 2,
+    NVME_ZFLAGS_AEN_PEND = 1 << 3,
 };
 
 typedef struct NvmeZone {
@@ -146,6 +149,7 @@ typedef struct NvmeNamespace {
     uint8_t         *zd_extensions;
     int32_t         nr_open_zones;
     int32_t         nr_active_zones;
+    bool            aen_pending;
 } NvmeNamespace;
 
 static inline NvmeLBAF *nvme_ns_lbaf(NvmeNamespace *ns)
