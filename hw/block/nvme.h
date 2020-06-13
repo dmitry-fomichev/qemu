@@ -22,6 +22,8 @@ typedef struct NvmeParams {
     uint32_t    zasl_kb;
     uint64_t    zone_size;
     uint64_t    zone_capacity;
+    int32_t     max_active_zones;
+    int32_t     max_open_zones;
 } NvmeParams;
 
 typedef struct NvmeAsyncEvent {
@@ -108,6 +110,8 @@ typedef struct NvmeNamespace {
     NvmeZoneList    *imp_open_zones;
     NvmeZoneList    *closed_zones;
     NvmeZoneList    *full_zones;
+    int32_t         nr_open_zones;
+    int32_t         nr_active_zones;
 } NvmeNamespace;
 
 static inline NvmeLBAF *nvme_ns_lbaf(NvmeNamespace *ns)
