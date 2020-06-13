@@ -111,6 +111,9 @@ static const uint32_t nvme_feature_cap[NVME_FID_MAX] = {
 };
 
 static void nvme_process_sq(void *opaque);
+static void nvme_enqueue_event(NvmeCtrl *n, uint8_t event_type,
+                               uint8_t event_info, uint8_t log_page,
+                               uint32_t nsid);
 
 static uint16_t nvme_cid(NvmeRequest *req)
 {
@@ -257,12 +260,24 @@ static inline void nvme_aor_dec_active(NvmeCtrl *n, NvmeNamespace *ns)
     assert(ns->nr_active_zones >= 0);
 }
 
+static inline void nvme_notify_zone_changed(NvmeCtrl *n, NvmeNamespace *ns,
+    NvmeZone *zone)
+{
+    if (n->features.async_config) {
+        zone->flags |= NVME_ZFLAGS_AEN_PEND;
+        nvme_enqueue_event(n, NVME_AER_TYPE_NOTICE,
+                           NVME_AER_NOTICE_ZONE_DESCR_CHANGED,
+                           NVME_LOG_ZONE_CHANGED_LIST, ns->nsid);
+    }
+}
+
 static void nvme_set_rzr(NvmeCtrl *n, NvmeNamespace *ns, NvmeZone *zone)
 {
     assert(zone->flags & NVME_ZFLAGS_SET_RZR);
     zone->tstamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     zone->flags &= ~NVME_ZFLAGS_TS_DELAY;
     zone->d.za |= NVME_ZA_RESET_RECOMMENDED;
+    nvme_notify_zone_changed(n, ns, zone);
     zone->flags &= ~NVME_ZFLAGS_SET_RZR;
     trace_pci_nvme_zone_reset_recommended(zone->d.zslba);
 }
@@ -271,10 +286,14 @@ static void nvme_clear_rzr(NvmeCtrl *n, NvmeNamespace *ns,
     NvmeZone *zone, bool notify)
 {
     if (n->params.rrl) {
-        zone->flags &= ~(NVME_ZFLAGS_SET_RZR | NVME_ZFLAGS_TS_DELAY);
+        zone->flags &= ~(NVME_ZFLAGS_SET_RZR | NVME_ZFLAGS_TS_DELAY |
+                         NVME_ZFLAGS_AEN_PEND);
         notify = notify && (zone->d.za & NVME_ZA_RESET_RECOMMENDED);
         zone->d.za &= ~NVME_ZA_RESET_RECOMMENDED;
         zone->tstamp = 0;
+        if (notify) {
+            nvme_notify_zone_changed(n, ns, zone);
+        }
     }
 }
 
@@ -284,6 +303,7 @@ static void nvme_set_fzr(NvmeCtrl *n, NvmeNamespace *ns, NvmeZone *zone)
     zone->tstamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     zone->flags &= ~NVME_ZFLAGS_TS_DELAY;
     zone->d.za |= NVME_ZA_FINISH_RECOMMENDED;
+    nvme_notify_zone_changed(n, ns, zone);
     zone->flags &= ~NVME_ZFLAGS_SET_FZR;
     trace_pci_nvme_zone_finish_recommended(zone->d.zslba);
 }
@@ -292,11 +312,59 @@ static void nvme_clear_fzr(NvmeCtrl *n, NvmeNamespace *ns,
     NvmeZone *zone, bool notify)
 {
     if (n->params.frl) {
-        zone->flags &= ~(NVME_ZFLAGS_SET_FZR | NVME_ZFLAGS_TS_DELAY);
+        zone->flags &= ~(NVME_ZFLAGS_SET_FZR | NVME_ZFLAGS_TS_DELAY |
+                         NVME_ZFLAGS_AEN_PEND);
         notify = notify && (zone->d.za & NVME_ZA_FINISH_RECOMMENDED);
         zone->d.za &= ~NVME_ZA_FINISH_RECOMMENDED;
         zone->tstamp = 0;
+        if (notify) {
+            nvme_notify_zone_changed(n, ns, zone);
+        }
     }
+}
+
+static bool nvme_process_rrl(NvmeCtrl *n, NvmeNamespace *ns, NvmeZone *zone)
+{
+    if (zone->flags & NVME_ZFLAGS_SET_RZR) {
+        if (zone->flags & NVME_ZFLAGS_TS_DELAY) {
+            assert(!(zone->d.za & NVME_ZA_RESET_RECOMMENDED));
+            if (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - zone->tstamp >=
+                n->rzr_delay_ns) {
+                nvme_set_rzr(n, ns, zone);
+                return true;
+            }
+        } else if (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - zone->tstamp >=
+                   n->rrl_ns) {
+            assert(zone->d.za & NVME_ZA_RESET_RECOMMENDED);
+            nvme_clear_rzr(n, ns, zone, true);
+            trace_pci_nvme_zone_reset_internal_op(zone->d.zslba);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool nvme_process_frl(NvmeCtrl *n, NvmeNamespace *ns, NvmeZone *zone)
+{
+    if (zone->flags & NVME_ZFLAGS_SET_FZR) {
+        if (zone->flags & NVME_ZFLAGS_TS_DELAY) {
+            assert(!(zone->d.za & NVME_ZA_FINISH_RECOMMENDED));
+            if (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - zone->tstamp >=
+                n->fzr_delay_ns) {
+                nvme_set_fzr(n, ns, zone);
+                return true;
+            }
+        } else if (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - zone->tstamp >=
+                   n->frl_ns) {
+            assert(zone->d.za & NVME_ZA_FINISH_RECOMMENDED);
+            nvme_clear_fzr(n, ns, zone, true);
+            trace_pci_nvme_zone_finish_internal_op(zone->d.zslba);
+            return true;
+        }
+    }
+
+    return false;
 }
 
 static void nvme_schedule_rzr(NvmeCtrl *n, NvmeNamespace *ns, NvmeZone *zone)
@@ -332,6 +400,48 @@ static void nvme_schedule_fzr(NvmeCtrl *n, NvmeNamespace *ns, NvmeZone *zone)
         } else {
             nvme_set_fzr(n, ns, zone);
         }
+    }
+}
+
+static void nvme_observe_ns_zone_time_limits(NvmeCtrl *n, NvmeNamespace *ns)
+{
+    NvmeZone *zone;
+
+    if (n->params.frl) {
+        for (zone = nvme_peek_zone_head(ns, ns->closed_zones);
+             zone;
+             zone = nvme_next_zone_in_list(ns, zone, ns->closed_zones)) {
+            nvme_process_frl(n, ns, zone);
+        }
+
+        for (zone = nvme_peek_zone_head(ns, ns->imp_open_zones);
+             zone;
+             zone = nvme_next_zone_in_list(ns, zone, ns->imp_open_zones)) {
+            nvme_process_frl(n, ns, zone);
+        }
+
+        for (zone = nvme_peek_zone_head(ns, ns->exp_open_zones);
+             zone;
+             zone = nvme_next_zone_in_list(ns, zone, ns->exp_open_zones)) {
+            nvme_process_frl(n, ns, zone);
+        }
+    }
+
+    if (n->params.rrl) {
+        for (zone = nvme_peek_zone_head(ns, ns->full_zones);
+             zone;
+             zone = nvme_next_zone_in_list(ns, zone, ns->full_zones)) {
+            nvme_process_rrl(n, ns, zone);
+        }
+    }
+}
+
+static void nvme_observe_zone_time_limits(NvmeCtrl *n)
+{
+    int i;
+
+    for (i = 0; i < n->num_namespaces; i++) {
+        nvme_observe_ns_zone_time_limits(n, &n->namespaces[i]);
     }
 }
 
@@ -743,6 +853,15 @@ static void nvme_post_cqes(void *opaque)
     if (cq->tail != cq->head) {
         nvme_irq_assert(n, cq);
     }
+
+    if (cq == &n->admin_cq &&
+        n->params.zoned && n->params.zone_async_events) {
+        nvme_observe_zone_time_limits(n);
+        if (timer_expired(cq->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL))) {
+            timer_mod(cq->timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 10 * SCALE_MS);
+        }
+    }
 }
 
 static void nvme_fill_data(QEMUSGList *qsg, QEMUIOVector *iov,
@@ -826,7 +945,8 @@ static void nvme_process_aers(void *opaque)
 }
 
 static void nvme_enqueue_event(NvmeCtrl *n, uint8_t event_type,
-                               uint8_t event_info, uint8_t log_page)
+                               uint8_t event_info, uint8_t log_page,
+                               uint32_t nsid)
 {
     NvmeAsyncEvent *event;
 
@@ -842,6 +962,7 @@ static void nvme_enqueue_event(NvmeCtrl *n, uint8_t event_type,
         .event_type = event_type,
         .event_info = event_info,
         .log_page   = log_page,
+        .nsid       = nsid,
     };
 
     QTAILQ_INSERT_TAIL(&n->aer_queue, event, entry);
@@ -903,6 +1024,7 @@ static void nvme_auto_transition_zone(NvmeCtrl *n, NvmeNamespace *ns,
             zone->d.za |= NVME_ZA_FINISHED_BY_CTLR;
             zone->flags = 0;
             zone->tstamp = 0;
+            nvme_notify_zone_changed(n, ns, zone);
             trace_pci_nvme_zone_finished_by_controller(zone->d.zslba);
         }
     }
@@ -1989,6 +2111,72 @@ static uint16_t nvme_cmd_effects(NvmeCtrl *n, uint8_t csi, uint32_t len,
                         DMA_DIRECTION_FROM_DEVICE, req);
 }
 
+static uint16_t nvme_changed_zones(NvmeCtrl *n, bool rae, int8_t csi,
+     uint32_t len, uint64_t off, NvmeRequest *req)
+{
+    NvmeCmd *cmd = &req->cmd;
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+    NvmeNamespace *ns;
+    NvmeChangedZoneLog zc_log = {};
+    uint64_t *zid_ptr = (void *)&zc_log +
+                        offsetof(NvmeChangedZoneLog, zone_ids);
+    uint64_t *zid_end = zid_ptr + ARRAY_SIZE(zc_log.zone_ids);
+    NvmeZone *zone;
+    uint32_t nsid = le32_to_cpu(cmd->nsid);
+    int i, nids = 0, num_aen_zones = 0;
+
+    trace_pci_nvme_changed_zone_log_read(nsid);
+
+    if (!n->params.zoned || !n->params.zone_async_events) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    if (unlikely(nsid == 0 || nsid > n->num_namespaces)) {
+        trace_pci_nvme_err_invalid_ns(nsid, n->num_namespaces);
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    ns = &n->namespaces[nsid - 1];
+    if (csi != ns->csi) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    if (off != 0) {
+        trace_pci_nvme_err_invalid_changed_zone_list_offset(off);
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    if (len != sizeof(zc_log)) {
+        trace_pci_nvme_err_invalid_changed_zone_list_len(len);
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    zone = ns->zone_array;
+    for (i = 0; i < n->num_zones && zid_ptr < zid_end; i++, zone++) {
+        if (!(zone->flags & NVME_ZFLAGS_AEN_PEND)) {
+            continue;
+        }
+        num_aen_zones++;
+        if (zone->d.za) {
+            trace_pci_nvme_reporting_changed_zone(zone->d.zslba, zone->d.za);
+            *zid_ptr++ = cpu_to_le64(zone->d.zslba);
+            nids++;
+        }
+        if (!rae) {
+            zone->flags &= ~NVME_ZFLAGS_AEN_PEND;
+        }
+    }
+
+    if (num_aen_zones && !nids) {
+        trace_pci_nvme_empty_changed_zone_list();
+        nids = 0xffff;
+    }
+    zc_log.nr_zone_ids = cpu_to_le16(nids);
+    ns->aen_pending = false;
+
+    return nvme_dma_prp(n, (uint8_t *)&zc_log, len, prp1, prp2,
+                        DMA_DIRECTION_FROM_DEVICE, req);
+}
+
 static uint16_t nvme_get_log(NvmeCtrl *n, NvmeRequest *req)
 {
     NvmeCmd *cmd = &req->cmd;
@@ -2035,6 +2223,8 @@ static uint16_t nvme_get_log(NvmeCtrl *n, NvmeRequest *req)
         return nvme_fw_log_info(n, len, off, req);
     case NVME_LOG_CMD_EFFECTS:
         return nvme_cmd_effects(n, csi, len, off, req);
+    case NVME_LOG_ZONE_CHANGED_LIST:
+        return nvme_changed_zones(n, rae, csi, len, off, req);
     default:
         trace_pci_nvme_err_invalid_log_page(nvme_cid(req), lid);
         return NVME_INVALID_FIELD | NVME_DNR;
@@ -2571,6 +2761,7 @@ static uint16_t nvme_get_feature(NvmeCtrl *n, NvmeRequest *req)
         goto out;
     case NVME_ASYNCHRONOUS_EVENT_CONF:
         result = n->features.async_config;
+        trace_pci_nvme_getfeat_aen_cfg(result);
         goto out;
     case NVME_TIMESTAMP:
         return nvme_get_feature_timestamp(n, req);
@@ -2699,7 +2890,7 @@ static uint16_t nvme_set_feature(NvmeCtrl *n, NvmeRequest *req)
             NVME_AEC_SMART(n->features.async_config) & NVME_SMART_TEMPERATURE) {
             nvme_enqueue_event(n, NVME_AER_TYPE_SMART,
                                NVME_AER_INFO_SMART_TEMP_THRESH,
-                               NVME_LOG_SMART_INFO);
+                               NVME_LOG_SMART_INFO, 0);
         }
 
         break;
@@ -2732,6 +2923,18 @@ static uint16_t nvme_set_feature(NvmeCtrl *n, NvmeRequest *req)
         break;
     case NVME_ASYNCHRONOUS_EVENT_CONF:
         n->features.async_config = dw11;
+        if (dw11 & NVME_AEN_CFG_ZONE_DESCR_CHNGD_NOTICES) {
+            if (!(n->features.async_config &
+                  NVME_AEN_CFG_ZONE_DESCR_CHNGD_NOTICES)) {
+                trace_pci_nvme_zone_aen_not_requested(dw11);
+            } else {
+                trace_pci_nvme_setfeat_zone_info_aer_on();
+            }
+        } else if (n->features.async_config &
+                   NVME_AEN_CFG_ZONE_DESCR_CHNGD_NOTICES) {
+            trace_pci_nvme_setfeat_zone_info_aer_off();
+            n->features.async_config &= ~NVME_AEN_CFG_ZONE_DESCR_CHNGD_NOTICES;
+        }
         break;
     case NVME_TIMESTAMP:
         return nvme_set_feature_timestamp(n, req);
@@ -2762,7 +2965,6 @@ static uint16_t nvme_aer(NvmeCtrl *n, NvmeRequest *req)
     if (!QTAILQ_EMPTY(&n->aer_queue)) {
         nvme_process_aers(n);
     }
-
     return NVME_NO_COMPLETE;
 }
 
@@ -3226,7 +3428,7 @@ static void nvme_process_db(NvmeCtrl *n, hwaddr addr, int val)
             if (n->outstanding_aers) {
                 nvme_enqueue_event(n, NVME_AER_TYPE_ERROR,
                                    NVME_AER_INFO_ERR_INVALID_DB_REGISTER,
-                                   NVME_LOG_ERROR_INFO);
+                                   NVME_LOG_ERROR_INFO, 0);
             }
 
             return;
@@ -3243,7 +3445,7 @@ static void nvme_process_db(NvmeCtrl *n, hwaddr addr, int val)
             if (n->outstanding_aers) {
                 nvme_enqueue_event(n, NVME_AER_TYPE_ERROR,
                                    NVME_AER_INFO_ERR_INVALID_DB_VALUE,
-                                   NVME_LOG_ERROR_INFO);
+                                   NVME_LOG_ERROR_INFO, 0);
             }
 
             return;
@@ -3280,7 +3482,7 @@ static void nvme_process_db(NvmeCtrl *n, hwaddr addr, int val)
             if (n->outstanding_aers) {
                 nvme_enqueue_event(n, NVME_AER_TYPE_ERROR,
                                    NVME_AER_INFO_ERR_INVALID_DB_REGISTER,
-                                   NVME_LOG_ERROR_INFO);
+                                   NVME_LOG_ERROR_INFO, 0);
             }
 
             return;
@@ -3297,7 +3499,7 @@ static void nvme_process_db(NvmeCtrl *n, hwaddr addr, int val)
             if (n->outstanding_aers) {
                 nvme_enqueue_event(n, NVME_AER_TYPE_ERROR,
                                    NVME_AER_INFO_ERR_INVALID_DB_VALUE,
-                                   NVME_LOG_ERROR_INFO);
+                                   NVME_LOG_ERROR_INFO, 0);
             }
 
             return;
@@ -3444,6 +3646,10 @@ static void nvme_zoned_init_ctrl(NvmeCtrl *n, Error **errp)
     }
     if (n->params.max_active_zones > nz) {
         n->params.max_active_zones = nz;
+    }
+
+    if (n->params.zone_async_events) {
+        n->features.async_config |= NVME_AEN_CFG_ZONE_DESCR_CHNGD_NOTICES;
     }
 
     return;
@@ -3745,6 +3951,7 @@ static void nvme_init_ctrl(NvmeCtrl *n, PCIDevice *pci_dev)
     id->aerl = n->params.aerl;
     id->frmw = (NVME_NUM_FW_SLOTS << 1) | NVME_FRMW_SLOT1_RO;
     id->lpa = NVME_LPA_EXTENDED;
+    id->oaes = cpu_to_le32(n->features.async_config);
 
     /* recommended default value (~70 C) */
     id->wctemp = cpu_to_le16(NVME_TEMPERATURE_WARNING);
@@ -3875,6 +4082,8 @@ static Property nvme_props[] = {
     DEFINE_PROP_UINT32("reset_rcmnd_limit", NvmeCtrl, params.rrl, 0),
     DEFINE_PROP_UINT32("finish_rcmnd_delay", NvmeCtrl, params.fzr_delay, 0),
     DEFINE_PROP_UINT32("finish_rcmnd_limit", NvmeCtrl, params.frl, 0),
+    DEFINE_PROP_BOOL("zone_async_events", NvmeCtrl, params.zone_async_events,
+                     false),
     DEFINE_PROP_BOOL("cross_zone_read", NvmeCtrl, params.cross_zone_read, true),
     DEFINE_PROP_BOOL("active_excursions", NvmeCtrl, params.active_excursions,
                      false),
