@@ -19,6 +19,7 @@ typedef struct NvmeParams {
     bool        zoned;
     bool        cross_zone_read;
     char        *zone_file;
+    bool        active_excursions;
     uint8_t     fill_pattern;
     uint32_t    zasl_kb;
     uint64_t    zone_size_mb;
