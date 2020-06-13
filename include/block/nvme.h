@@ -630,8 +630,11 @@ typedef struct QEMU_PACKED NvmeDsmRange {
 enum NvmeAsyncEventRequest {
     NVME_AER_TYPE_ERROR                     = 0,
     NVME_AER_TYPE_SMART                     = 1,
+    NVME_AER_TYPE_NOTICE                    = 2,
     NVME_AER_TYPE_IO_SPECIFIC               = 6,
     NVME_AER_TYPE_VENDOR_SPECIFIC           = 7,
+    NVME_AER_NOTICE_NS_CHANGED              = 0,
+    NVME_AER_NOTICE_ZONE_DESCR_CHANGED      = 0xef,
     NVME_AER_INFO_ERR_INVALID_DB_REGISTER   = 0,
     NVME_AER_INFO_ERR_INVALID_DB_VALUE      = 1,
     NVME_AER_INFO_ERR_DIAG_FAIL             = 2,
@@ -643,11 +646,17 @@ enum NvmeAsyncEventRequest {
     NVME_AER_INFO_SMART_SPARE_THRESH        = 2,
 };
 
+enum NvmeAsyncEventCfg {
+    NVME_AEN_CFG_NS_ATTR                    = 1 << 8,
+    NVME_AEN_CFG_ZONE_DESCR_CHNGD_NOTICES   = 1 << 27,
+};
+
 typedef struct QEMU_PACKED NvmeAerResult {
-    uint8_t event_type;
-    uint8_t event_info;
-    uint8_t log_page;
-    uint8_t resv;
+    uint8_t    event_type;
+    uint8_t    event_info;
+    uint8_t    log_page;
+    uint8_t    resv;
+    uint32_t   nsid;
 } NvmeAerResult;
 
 typedef struct QEMU_PACKED NvmeCqe {
@@ -797,10 +806,11 @@ enum {
 };
 
 enum NvmeLogIdentifier {
-    NVME_LOG_ERROR_INFO     = 0x01,
-    NVME_LOG_SMART_INFO     = 0x02,
-    NVME_LOG_FW_SLOT_INFO   = 0x03,
-    NVME_LOG_CMD_EFFECTS    = 0x05,
+    NVME_LOG_ERROR_INFO                = 0x01,
+    NVME_LOG_SMART_INFO                = 0x02,
+    NVME_LOG_FW_SLOT_INFO              = 0x03,
+    NVME_LOG_CMD_EFFECTS               = 0x05,
+    NVME_LOG_ZONE_CHANGED_LIST         = 0xbf,
 };
 
 typedef struct QEMU_PACKED NvmePSD {
@@ -814,6 +824,12 @@ typedef struct QEMU_PACKED NvmePSD {
     uint8_t     rwl;
     uint8_t     resv[16];
 } NvmePSD;
+
+typedef struct QEMU_PACKED NvmeChangedZoneLog {
+    uint16_t    nr_zone_ids;
+    uint8_t     rsvd2[6];
+    uint64_t    zone_ids[511];
+} NvmeChangedZoneLog;
 
 #define NVME_IDENTIFY_DATA_SIZE 4096
 
@@ -1201,7 +1217,7 @@ enum NvmeZoneState {
 static inline void _nvme_check_size(void)
 {
     QEMU_BUILD_BUG_ON(sizeof(NvmeBar) != 4096);
-    QEMU_BUILD_BUG_ON(sizeof(NvmeAerResult) != 4);
+    QEMU_BUILD_BUG_ON(sizeof(NvmeAerResult) != 8);
     QEMU_BUILD_BUG_ON(sizeof(NvmeCqe) != 16);
     QEMU_BUILD_BUG_ON(sizeof(NvmeDsmRange) != 16);
     QEMU_BUILD_BUG_ON(sizeof(NvmeCmd) != 64);
@@ -1216,6 +1232,7 @@ static inline void _nvme_check_size(void)
     QEMU_BUILD_BUG_ON(sizeof(NvmeFwSlotInfoLog) != 512);
     QEMU_BUILD_BUG_ON(sizeof(NvmeSmartLog) != 512);
     QEMU_BUILD_BUG_ON(sizeof(NvmeEffectsLog) != 4096);
+    QEMU_BUILD_BUG_ON(sizeof(NvmeChangedZoneLog) != 4096);
     QEMU_BUILD_BUG_ON(sizeof(NvmeIdCtrl) != 4096);
     QEMU_BUILD_BUG_ON(sizeof(NvmeIdCtrlZoned) != 4096);
     QEMU_BUILD_BUG_ON(sizeof(NvmeIdNsDescr) != 4);
