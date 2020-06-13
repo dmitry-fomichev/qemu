@@ -118,6 +118,20 @@ static int nvme_calc_zone_geometry(NvmeNamespace *ns, Error **errp)
         ns->zone_size_log2 = 63 - clz64(ns->zone_size);
     }
 
+    /* Make sure that the values of all ZNS properties are sane */
+    if (ns->params.max_open_zones > nz) {
+        error_setg(errp,
+                   "max_open_zones value %u exceeds the number of zones %u",
+                   ns->params.max_open_zones, nz);
+        return -1;
+    }
+    if (ns->params.max_active_zones > nz) {
+        error_setg(errp,
+                   "max_active_zones value %u exceeds the number of zones %u",
+                   ns->params.max_active_zones, nz);
+        return -1;
+    }
+
     return 0;
 }
 
@@ -172,8 +186,8 @@ static int nvme_zoned_init_ns(NvmeCtrl *n, NvmeNamespace *ns, int lba_index,
     id_ns_z = g_malloc0(sizeof(NvmeIdNsZoned));
 
     /* MAR/MOR are zeroes-based, 0xffffffff means no limit */
-    id_ns_z->mar = 0xffffffff;
-    id_ns_z->mor = 0xffffffff;
+    id_ns_z->mar = cpu_to_le32(ns->params.max_active_zones - 1);
+    id_ns_z->mor = cpu_to_le32(ns->params.max_open_zones - 1);
     id_ns_z->zoc = 0;
     id_ns_z->ozcs = ns->params.cross_zone_read ? 0x01 : 0x00;
 
@@ -199,6 +213,9 @@ static void nvme_zoned_clear_ns(NvmeNamespace *ns)
     uint32_t set_state;
     int i;
 
+    ns->nr_active_zones = 0;
+    ns->nr_open_zones = 0;
+
     zone = ns->zone_array;
     for (i = 0; i < ns->num_zones; i++, zone++) {
         switch (nvme_get_zone_state(zone)) {
@@ -209,6 +226,7 @@ static void nvme_zoned_clear_ns(NvmeNamespace *ns)
             QTAILQ_REMOVE(&ns->exp_open_zones, zone, entry);
             break;
         case NVME_ZONE_STATE_CLOSED:
+            nvme_aor_inc_active(ns);
             /* fall through */
         default:
             continue;
@@ -216,6 +234,9 @@ static void nvme_zoned_clear_ns(NvmeNamespace *ns)
 
         if (zone->d.wp == zone->d.zslba) {
             set_state = NVME_ZONE_STATE_EMPTY;
+        } else if (ns->params.max_active_zones == 0 ||
+                   ns->nr_active_zones < ns->params.max_active_zones) {
+            set_state = NVME_ZONE_STATE_CLOSED;
         } else {
             set_state = NVME_ZONE_STATE_CLOSED;
         }
@@ -224,6 +245,7 @@ static void nvme_zoned_clear_ns(NvmeNamespace *ns)
         case NVME_ZONE_STATE_CLOSED:
             trace_pci_nvme_clear_ns_close(nvme_get_zone_state(zone),
                                           zone->d.zslba);
+            nvme_aor_inc_active(ns);
             QTAILQ_INSERT_TAIL(&ns->closed_zones, zone, entry);
             break;
         case NVME_ZONE_STATE_EMPTY:
@@ -326,6 +348,8 @@ static Property nvme_ns_props[] = {
     DEFINE_PROP_SIZE("zone_capacity", NvmeNamespace, params.zone_cap_bs, 0),
     DEFINE_PROP_BOOL("cross_zone_read", NvmeNamespace,
                      params.cross_zone_read, false),
+    DEFINE_PROP_UINT32("max_active", NvmeNamespace, params.max_active_zones, 0),
+    DEFINE_PROP_UINT32("max_open", NvmeNamespace, params.max_open_zones, 0),
     DEFINE_PROP_END_OF_LIST(),
 };
 
