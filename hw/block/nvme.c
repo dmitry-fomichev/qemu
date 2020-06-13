@@ -800,6 +800,26 @@ static void nvme_auto_transition_zone(NvmeCtrl *n, NvmeNamespace *ns,
 {
     NvmeZone *zone;
 
+    if (n->params.active_excursions && adding_active &&
+        n->params.max_active_zones &&
+        ns->nr_active_zones == n->params.max_active_zones) {
+        zone = nvme_peek_zone_head(ns, ns->closed_zones);
+        if (zone) {
+            /*
+             * The namespace is at the limit of active zones.
+             * Try to finish one of the currently active zones
+             * to make the needed active zone resource available.
+             */
+            nvme_aor_dec_active(n, ns);
+            nvme_assign_zone_state(n, ns, zone, NVME_ZONE_STATE_FULL);
+            zone->d.za &= ~(NVME_ZA_FINISH_RECOMMENDED |
+                            NVME_ZA_RESET_RECOMMENDED);
+            zone->d.za |= NVME_ZA_FINISHED_BY_CTLR;
+            zone->tstamp = 0;
+            trace_pci_nvme_zone_finished_by_controller(zone->d.zslba);
+        }
+    }
+
     if (implicit && n->params.max_open_zones &&
         ns->nr_open_zones == n->params.max_open_zones) {
         zone = nvme_remove_zone_head(n, ns, ns->imp_open_zones);
@@ -3378,7 +3398,7 @@ static int nvme_zoned_init_ns(NvmeCtrl *n, NvmeNamespace *ns, int lba_index,
     /* MAR/MOR are zeroes-based, 0xffffffff means no limit */
     ns->id_ns_zoned->mar = cpu_to_le32(n->params.max_active_zones - 1);
     ns->id_ns_zoned->mor = cpu_to_le32(n->params.max_open_zones - 1);
-    ns->id_ns_zoned->zoc = 0;
+    ns->id_ns_zoned->zoc = cpu_to_le16(n->params.active_excursions ? 0x2 : 0);
     ns->id_ns_zoned->ozcs = n->params.cross_zone_read ? 0x01 : 0x00;
 
     ns->id_ns_zoned->lbafe[lba_index].zsze = cpu_to_le64(n->params.zone_size);
@@ -3775,6 +3795,8 @@ static Property nvme_props[] = {
     DEFINE_PROP_INT32("max_active", NvmeCtrl, params.max_active_zones, 0),
     DEFINE_PROP_INT32("max_open", NvmeCtrl, params.max_open_zones, 0),
     DEFINE_PROP_BOOL("cross_zone_read", NvmeCtrl, params.cross_zone_read, true),
+    DEFINE_PROP_BOOL("active_excursions", NvmeCtrl, params.active_excursions,
+                     false),
     DEFINE_PROP_UINT8("fill_pattern", NvmeCtrl, params.fill_pattern, 0),
     DEFINE_PROP_END_OF_LIST(),
 };
