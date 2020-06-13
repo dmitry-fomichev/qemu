@@ -29,6 +29,10 @@ typedef struct NvmeParams {
     uint32_t    zd_extension_size;
     uint32_t    nr_offline_zones;
     uint32_t    nr_rdonly_zones;
+    uint32_t    rzr_delay;
+    uint32_t    rrl;
+    uint32_t    fzr_delay;
+    uint32_t    frl;
 } NvmeParams;
 
 typedef struct NvmeAsyncEvent {
@@ -80,12 +84,19 @@ typedef struct NvmeCQueue {
     QTAILQ_HEAD(, NvmeRequest) req_list;
 } NvmeCQueue;
 
+enum NvmeZoneFlags {
+    NVME_ZFLAGS_TS_DELAY = 1 << 0,
+    NVME_ZFLAGS_SET_RZR  = 1 << 1,
+    NVME_ZFLAGS_SET_FZR  = 1 << 2,
+};
+
 typedef struct NvmeZone {
     NvmeZoneDescr   d;
     uint64_t        tstamp;
+    uint32_t        flags;
     uint32_t        next;
     uint32_t        prev;
-    uint8_t         rsvd80[8];
+    uint8_t         rsvd84[4];
 } NvmeZone;
 
 #define NVME_ZONE_LIST_NIL    UINT_MAX
@@ -199,6 +210,10 @@ typedef struct NvmeCtrl {
     uint64_t        zone_size;
     uint64_t        zone_capacity;
     uint64_t        zone_array_size;
+    uint64_t        rzr_delay_ns;
+    uint64_t        rrl_ns;
+    uint64_t        fzr_delay_ns;
+    uint64_t        frl_ns;
     uint32_t        zone_size_log2;
     uint32_t        zasl_bs;
     uint8_t         zasl;

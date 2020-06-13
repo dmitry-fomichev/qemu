@@ -89,6 +89,24 @@
  *         during read.
  *
  *     active_excursions=<enable emulation of zone excursions, default: false>
+ *
+ *     reset_rcmnd_delay=<Reset Zone Recommended Delay in milliseconds>
+ *         The amount of time that passes between the moment when a zone
+ *         enters Full state and when Reset Zone Recommended attribute
+ *         is set for that zone.
+ *
+ *     reset_rcmnd_limit=<Reset Zone Recommended Limit in milliseconds>
+ *         If this value is zero (default), RZR attribute is not set for
+ *          any zones.
+ *
+ *     finish_rcmnd_delay=<Finish Zone Recommended Delay in milliseconds>
+ *         The amount of time that passes between the moment when a zone
+ *         enters an Open or Closed state and when Finish Zone Recommended
+ *         attribute is set for that zone.
+ *
+ *     finish_rcmnd_limit=<Finish Zone Recommended Limit in milliseconds>
+ *         If this value is zero (default), FZR attribute is not set for
+ *         any zones.
  */
 
 #include "qemu/osdep.h"
@@ -305,6 +323,84 @@ static inline void nvme_aor_dec_active(NvmeCtrl *n, NvmeNamespace *ns)
     assert(ns->nr_active_zones >= 0);
 }
 
+static void nvme_set_rzr(NvmeCtrl *n, NvmeNamespace *ns, NvmeZone *zone)
+{
+    assert(zone->flags & NVME_ZFLAGS_SET_RZR);
+    zone->tstamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    zone->flags &= ~NVME_ZFLAGS_TS_DELAY;
+    zone->d.za |= NVME_ZA_RESET_RECOMMENDED;
+    zone->flags &= ~NVME_ZFLAGS_SET_RZR;
+    trace_pci_nvme_zone_reset_recommended(zone->d.zslba);
+}
+
+static void nvme_clear_rzr(NvmeCtrl *n, NvmeNamespace *ns,
+                           NvmeZone *zone, bool notify)
+{
+    if (n->params.rrl) {
+        zone->flags &= ~(NVME_ZFLAGS_SET_RZR | NVME_ZFLAGS_TS_DELAY);
+        notify = notify && (zone->d.za & NVME_ZA_RESET_RECOMMENDED);
+        zone->d.za &= ~NVME_ZA_RESET_RECOMMENDED;
+        zone->tstamp = 0;
+    }
+}
+
+static void nvme_set_fzr(NvmeCtrl *n, NvmeNamespace *ns, NvmeZone *zone)
+{
+    assert(zone->flags & NVME_ZFLAGS_SET_FZR);
+    zone->tstamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    zone->flags &= ~NVME_ZFLAGS_TS_DELAY;
+    zone->d.za |= NVME_ZA_FINISH_RECOMMENDED;
+    zone->flags &= ~NVME_ZFLAGS_SET_FZR;
+    trace_pci_nvme_zone_finish_recommended(zone->d.zslba);
+}
+
+static void nvme_clear_fzr(NvmeCtrl *n, NvmeNamespace *ns,
+                           NvmeZone *zone, bool notify)
+{
+    if (n->params.frl) {
+        zone->flags &= ~(NVME_ZFLAGS_SET_FZR | NVME_ZFLAGS_TS_DELAY);
+        notify = notify && (zone->d.za & NVME_ZA_FINISH_RECOMMENDED);
+        zone->d.za &= ~NVME_ZA_FINISH_RECOMMENDED;
+        zone->tstamp = 0;
+    }
+}
+
+static void nvme_schedule_rzr(NvmeCtrl *n, NvmeNamespace *ns, NvmeZone *zone)
+{
+    if (n->params.frl) {
+        zone->flags &= ~(NVME_ZFLAGS_SET_FZR | NVME_ZFLAGS_TS_DELAY);
+        zone->d.za &= ~NVME_ZA_FINISH_RECOMMENDED;
+        zone->tstamp = 0;
+    }
+    if (n->params.rrl) {
+        zone->flags |= NVME_ZFLAGS_SET_RZR;
+        if (n->params.rzr_delay) {
+            zone->tstamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            zone->flags |= NVME_ZFLAGS_TS_DELAY;
+        } else {
+            nvme_set_rzr(n, ns, zone);
+        }
+    }
+}
+
+static void nvme_schedule_fzr(NvmeCtrl *n, NvmeNamespace *ns, NvmeZone *zone)
+{
+    if (n->params.rrl) {
+        zone->flags &= ~(NVME_ZFLAGS_SET_RZR | NVME_ZFLAGS_TS_DELAY);
+        zone->d.za &= ~NVME_ZA_RESET_RECOMMENDED;
+        zone->tstamp = 0;
+    }
+    if (n->params.frl) {
+        zone->flags |= NVME_ZFLAGS_SET_FZR;
+        if (n->params.fzr_delay) {
+            zone->tstamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            zone->flags |= NVME_ZFLAGS_TS_DELAY;
+        } else {
+            nvme_set_fzr(n, ns, zone);
+        }
+    }
+}
+
 static void nvme_assign_zone_state(NvmeCtrl *n, NvmeNamespace *ns,
                                    NvmeZone *zone, uint8_t state)
 {
@@ -312,15 +408,19 @@ static void nvme_assign_zone_state(NvmeCtrl *n, NvmeNamespace *ns,
         switch (nvme_get_zone_state(zone)) {
         case NVME_ZONE_STATE_EXPLICITLY_OPEN:
             nvme_remove_zone(n, ns, ns->exp_open_zones, zone);
+            nvme_clear_fzr(n, ns, zone, false);
             break;
         case NVME_ZONE_STATE_IMPLICITLY_OPEN:
             nvme_remove_zone(n, ns, ns->imp_open_zones, zone);
+            nvme_clear_fzr(n, ns, zone, false);
             break;
         case NVME_ZONE_STATE_CLOSED:
             nvme_remove_zone(n, ns, ns->closed_zones, zone);
+            nvme_clear_fzr(n, ns, zone, false);
             break;
         case NVME_ZONE_STATE_FULL:
             nvme_remove_zone(n, ns, ns->full_zones, zone);
+            nvme_clear_rzr(n, ns, zone, false);
         }
    }
 
@@ -329,15 +429,19 @@ static void nvme_assign_zone_state(NvmeCtrl *n, NvmeNamespace *ns,
     switch (state) {
     case NVME_ZONE_STATE_EXPLICITLY_OPEN:
         nvme_add_zone_tail(n, ns, ns->exp_open_zones, zone);
+        nvme_schedule_fzr(n, ns, zone);
         break;
     case NVME_ZONE_STATE_IMPLICITLY_OPEN:
         nvme_add_zone_tail(n, ns, ns->imp_open_zones, zone);
+        nvme_schedule_fzr(n, ns, zone);
         break;
     case NVME_ZONE_STATE_CLOSED:
         nvme_add_zone_tail(n, ns, ns->closed_zones, zone);
+        nvme_schedule_fzr(n, ns, zone);
         break;
     case NVME_ZONE_STATE_FULL:
         nvme_add_zone_tail(n, ns, ns->full_zones, zone);
+        nvme_schedule_rzr(n, ns, zone);
         break;
     default:
         zone->d.za = 0;
@@ -862,6 +966,7 @@ static void nvme_auto_transition_zone(NvmeCtrl *n, NvmeNamespace *ns,
             zone->d.za &= ~(NVME_ZA_FINISH_RECOMMENDED |
                             NVME_ZA_RESET_RECOMMENDED);
             zone->d.za |= NVME_ZA_FINISHED_BY_CTLR;
+            zone->flags = 0;
             zone->tstamp = 0;
             trace_pci_nvme_zone_finished_by_controller(zone->d.zslba);
         }
@@ -3893,6 +3998,16 @@ static int nvme_zoned_init_ns(NvmeCtrl *n, NvmeNamespace *ns, int lba_index,
     /* MAR/MOR are zeroes-based, 0xffffffff means no limit */
     ns->id_ns_zoned->mar = cpu_to_le32(n->params.max_active_zones - 1);
     ns->id_ns_zoned->mor = cpu_to_le32(n->params.max_open_zones - 1);
+
+    ns->id_ns_zoned->rrl = cpu_to_le32(n->params.rrl);
+    ns->id_ns_zoned->frl = cpu_to_le32(n->params.frl);
+    if (n->params.rrl || n->params.frl) {
+        n->rzr_delay_ns = n->params.rzr_delay * NANOSECONDS_PER_SECOND;
+        n->rrl_ns = n->params.rrl * NANOSECONDS_PER_SECOND;
+        n->fzr_delay_ns = n->params.fzr_delay * NANOSECONDS_PER_SECOND;
+        n->frl_ns = n->params.frl * NANOSECONDS_PER_SECOND;
+    }
+
     ns->id_ns_zoned->zoc = cpu_to_le16(n->params.active_excursions ? 0x2 : 0);
     ns->id_ns_zoned->ozcs = n->params.cross_zone_read ? 0x01 : 0x00;
 
@@ -4304,6 +4419,10 @@ static Property nvme_props[] = {
     DEFINE_PROP_UINT32("max_open", NvmeCtrl, params.max_open_zones, 0),
     DEFINE_PROP_UINT32("offline_zones", NvmeCtrl, params.nr_offline_zones, 0),
     DEFINE_PROP_UINT32("rdonly_zones", NvmeCtrl, params.nr_rdonly_zones, 0),
+    DEFINE_PROP_UINT32("reset_rcmnd_delay", NvmeCtrl, params.rzr_delay, 0),
+    DEFINE_PROP_UINT32("reset_rcmnd_limit", NvmeCtrl, params.rrl, 0),
+    DEFINE_PROP_UINT32("finish_rcmnd_delay", NvmeCtrl, params.fzr_delay, 0),
+    DEFINE_PROP_UINT32("finish_rcmnd_limit", NvmeCtrl, params.frl, 0),
     DEFINE_PROP_BOOL("cross_zone_read", NvmeCtrl, params.cross_zone_read, true),
     DEFINE_PROP_BOOL("active_excursions", NvmeCtrl, params.active_excursions,
                      false),
