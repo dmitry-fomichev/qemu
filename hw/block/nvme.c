@@ -9,7 +9,7 @@
  */
 
 /**
- * Reference Specs: http://www.nvmexpress.org, 1.2, 1.1, 1.0e
+ * Reference Specs: http://www.nvmexpress.org, 1.4, 1.3, 1.2, 1.1, 1.0e
  *
  *  https://nvmexpress.org/developers/nvme-specification/
  */
@@ -23,7 +23,8 @@
  *              max_ioqpairs=<N[optional]>, \
  *              aerl=<N[optional]>, aer_max_queued=<N[optional]>, \
  *              mdts=<N[optional]>
- *      -device nvme-ns,drive=<drive_id>,bus=bus_name,nsid=<nsid>
+ *      -device nvme-ns,drive=<drive_id>,bus=<bus_name>,nsid=<nsid>, \
+ *              zoned=<true|false[optional]>
  *
  * Note cmb_size_mb denotes size of CMB in MB. CMB is assumed to be at
  * offset 0 in BAR2 and supports only WDS, RDS and SQS for now.
@@ -49,6 +50,42 @@
  *   completion when there are no oustanding AERs. When the maximum number of
  *   enqueued events are reached, subsequent events will be dropped.
  *
+ * Setting `zoned` to true selects Zoned Command Set at the namespace.
+ * In this case, the following options are available to configure zoned
+ * operation:
+ *     zoned.zsze=<zone size in bytes, default: 128MiB>
+ *         The number may be followed by K, M, G as in kilo-, mega- or giga.
+ *
+ *     zoned.zcap=<zone capacity in bytes, default: zone size>
+ *         The value 0 (default) forces zone capacity to be the same as zone
+ *         size. The value of this property may not exceed zone size.
+ *
+ *     zoned.descr_ext_size=<zone descriptor extension size, default 0>
+ *         This value needs to be specified in 64B units. If it is zero,
+ *         namespace(s) will not support zone descriptor extensions.
+ *
+ *     zoned.max_active=<Maximum Active Resources (zones), default: 0>
+ *         The default value means there is no limit to the number of
+ *         concurrently active zones.
+ *
+ *     zoned.max_open=<Maximum Open Resources (zones), default: 0>
+ *         The default value means there is no limit to the number of
+ *         concurrently open zones.
+ *
+ *     zoned.append_size_limit=<zone append size limit, default: 128KiB>
+ *         The maximum I/O size that can be supported by Zone Append
+ *         command in bytes. Since internally this this value is maintained
+ *         as ZASL = log2(<maximum append size> / <page size>), some values
+ *         assigned to this property may be rounded down and result in a lower
+ *         maximum ZA data size being in effect. By setting this property to 0,
+ *         user can make ZASL to be equial to MDTS.
+ *
+ *     zoned.offline_zones=<the number of offline zones to inject, default: 0>
+ *
+ *     zoned.rdonly_zones=<the number of read-only zones to inject, default: 0>
+ *
+ *     zoned.cross_zone_read=<enable RAZB, default: false>
+ *         Setting this property to true enables Read Across Zone Boundaries.
  */
 
 #include "qemu/osdep.h"
