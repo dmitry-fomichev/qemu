@@ -67,6 +67,7 @@ typedef struct NvmeNamespace {
     uint32_t        nsid;
     uint8_t         csi;
     QemuUUID        uuid;
+    bool            attached;
 } NvmeNamespace;
 
 static inline NvmeLBAF *nvme_ns_lbaf(NvmeNamespace *ns)
