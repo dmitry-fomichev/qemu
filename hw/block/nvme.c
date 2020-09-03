@@ -2328,12 +2328,15 @@ static uint16_t nvme_identify_ctrl_csi(NvmeCtrl *n, NvmeIdentify *c)
     }
 }
 
-static uint16_t nvme_identify_ns(NvmeCtrl *n, NvmeIdentify *c)
+static uint16_t nvme_identify_ns(NvmeCtrl *n, NvmeIdentify *c, bool only_active)
 {
     NvmeNamespace *ns;
     uint32_t nsid = le32_to_cpu(c->nsid);
     uint64_t prp1 = le64_to_cpu(c->prp1);
     uint64_t prp2 = le64_to_cpu(c->prp2);
+    static const int data_len = NVME_IDENTIFY_DATA_SIZE;
+    uint32_t *list;
+    uint16_t ret;
 
     trace_pci_nvme_identify_ns(nsid);
 
@@ -2345,6 +2348,13 @@ static uint16_t nvme_identify_ns(NvmeCtrl *n, NvmeIdentify *c)
     ns = &n->namespaces[nsid - 1];
     assert(nsid == ns->nsid);
 
+    if (only_active && !ns->attached) {
+        list = g_malloc0(data_len);
+        ret = nvme_dma_read_prp(n, (uint8_t *)list, data_len, prp1, prp2);
+        g_free(list);
+        return ret;
+    }
+
     if (c->csi == NVME_CSI_NVM && nvme_csi_has_nvm_support(ns)) {
         return nvme_dma_read_prp(n, (uint8_t *)&ns->id_ns, sizeof(ns->id_ns),
             prp1, prp2);
@@ -2353,7 +2363,8 @@ static uint16_t nvme_identify_ns(NvmeCtrl *n, NvmeIdentify *c)
     return NVME_INVALID_CMD_SET | NVME_DNR;
 }
 
-static uint16_t nvme_identify_ns_csi(NvmeCtrl *n, NvmeIdentify *c)
+static uint16_t nvme_identify_ns_csi(NvmeCtrl *n, NvmeIdentify *c,
+    bool only_active)
 {
     NvmeNamespace *ns;
     uint32_t nsid = le32_to_cpu(c->nsid);
@@ -2373,6 +2384,13 @@ static uint16_t nvme_identify_ns_csi(NvmeCtrl *n, NvmeIdentify *c)
     ns = &n->namespaces[nsid - 1];
     assert(nsid == ns->nsid);
 
+    if (only_active && !ns->attached) {
+        list = g_malloc0(data_len);
+        ret = nvme_dma_read_prp(n, (uint8_t *)list, data_len, prp1, prp2);
+        g_free(list);
+        return ret;
+    }
+
     if (c->csi == NVME_CSI_NVM && nvme_csi_has_nvm_support(ns)) {
         list = g_malloc0(data_len);
         ret = nvme_dma_read_prp(n, (uint8_t *)list, data_len, prp1, prp2);
@@ -2386,7 +2404,8 @@ static uint16_t nvme_identify_ns_csi(NvmeCtrl *n, NvmeIdentify *c)
     return NVME_INVALID_FIELD | NVME_DNR;
 }
 
-static uint16_t nvme_identify_nslist(NvmeCtrl *n, NvmeIdentify *c)
+static uint16_t nvme_identify_nslist(NvmeCtrl *n, NvmeIdentify *c,
+    bool only_active)
 {
     static const int data_len = NVME_IDENTIFY_DATA_SIZE;
     uint32_t min_nsid = le32_to_cpu(c->nsid);
@@ -2410,7 +2429,7 @@ static uint16_t nvme_identify_nslist(NvmeCtrl *n, NvmeIdentify *c)
 
     list = g_malloc0(data_len);
     for (i = 0; i < n->num_namespaces; i++) {
-        if (i < min_nsid) {
+        if (i < min_nsid || (only_active && !n->namespaces[i].attached)) {
             continue;
         }
         list[j++] = cpu_to_le32(i + 1);
@@ -2423,7 +2442,8 @@ static uint16_t nvme_identify_nslist(NvmeCtrl *n, NvmeIdentify *c)
     return ret;
 }
 
-static uint16_t nvme_identify_nslist_csi(NvmeCtrl *n, NvmeIdentify *c)
+static uint16_t nvme_identify_nslist_csi(NvmeCtrl *n, NvmeIdentify *c,
+    bool only_active)
 {
     static const int data_len = NVME_IDENTIFY_DATA_SIZE;
     uint32_t min_nsid = le32_to_cpu(c->nsid);
@@ -2441,7 +2461,8 @@ static uint16_t nvme_identify_nslist_csi(NvmeCtrl *n, NvmeIdentify *c)
 
     list = g_malloc0(data_len);
     for (i = 0; i < n->num_namespaces; i++) {
-        if (i < min_nsid || c->csi != n->namespaces[i].csi) {
+        if (i < min_nsid || c->csi != n->namespaces[i].csi ||
+            (only_active && !n->namespaces[i].attached)) {
             continue;
         }
         list[j++] = cpu_to_le32(i + 1);
@@ -2531,19 +2552,27 @@ static uint16_t nvme_identify(NvmeCtrl *n, NvmeCmd *cmd)
 
     switch (le32_to_cpu(c->cns)) {
     case NVME_ID_CNS_NS:
-        return nvme_identify_ns(n, c);
+        return nvme_identify_ns(n, c, true);
     case NVME_ID_CNS_CS_NS:
-        return nvme_identify_ns_csi(n, c);
+        return nvme_identify_ns_csi(n, c, true);
+    case NVME_ID_CNS_NS_PRESENT:
+        return nvme_identify_ns(n, c, false);
+    case NVME_ID_CNS_CS_NS_PRESENT:
+        return nvme_identify_ns_csi(n, c, false);
     case NVME_ID_CNS_CTRL:
         return nvme_identify_ctrl(n, c);
     case NVME_ID_CNS_CS_CTRL:
         return nvme_identify_ctrl_csi(n, c);
     case NVME_ID_CNS_NS_ACTIVE_LIST:
-        return nvme_identify_nslist(n, c);
+        return nvme_identify_nslist(n, c, true);
+    case NVME_ID_CNS_CS_NS_ACTIVE_LIST:
+        return nvme_identify_nslist_csi(n, c, true);
+    case NVME_ID_CNS_NS_PRESENT_LIST:
+        return nvme_identify_nslist(n, c, false);
+    case NVME_ID_CNS_CS_NS_PRESENT_LIST:
+        return nvme_identify_nslist_csi(n, c, false);
     case NVME_ID_CNS_NS_DESCR_LIST:
         return nvme_identify_ns_descr_list(n, c);
-    case NVME_ID_CNS_CS_NS_ACTIVE_LIST:
-        return nvme_identify_nslist_csi(n, c);
     case NVME_ID_CNS_IO_COMMAND_SET:
         return nvme_identify_cmd_set(n, c);
     default:
@@ -2987,6 +3016,7 @@ static int nvme_start_ctrl(NvmeCtrl *n)
 {
     uint32_t page_bits = NVME_CC_MPS(n->bar.cc) + 12;
     uint32_t page_size = 1 << page_bits;
+    int i;
 
     if (unlikely(n->cq[0])) {
         trace_pci_nvme_err_startfail_cq();
@@ -3072,6 +3102,23 @@ static int nvme_start_ctrl(NvmeCtrl *n)
         NVME_AQA_ACQS(n->bar.aqa) + 1, 1);
     nvme_init_sq(&n->admin_sq, n, n->bar.asq, 0, 0,
         NVME_AQA_ASQS(n->bar.aqa) + 1);
+
+    for (i = 0; i < n->num_namespaces; i++) {
+        n->namespaces[i].attached = false;
+        switch (n->namespaces[i].csi) {
+        case NVME_CSI_NVM:
+            if (NVME_CC_CSS(n->bar.cc) == CSS_NVM_ONLY ||
+                NVME_CC_CSS(n->bar.cc) == CSS_ALL_NSTYPES) {
+                n->namespaces[i].attached = true;
+            }
+            break;
+        case NVME_CSI_ZONED:
+            if (NVME_CC_CSS(n->bar.cc) == CSS_ALL_NSTYPES) {
+                n->namespaces[i].attached = true;
+            }
+            break;
+        }
+    }
 
     if (n->params.zoned) {
         n->zasl = nvme_ilog2(n->zasl_bs / page_size);
