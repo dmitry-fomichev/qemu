@@ -156,6 +156,7 @@ typedef struct NvmeNamespace {
     int32_t         nr_open_zones;
     int32_t         nr_active_zones;
     bool            aen_pending;
+    bool            attached;
 } NvmeNamespace;
 
 static inline NvmeLBAF *nvme_ns_lbaf(NvmeNamespace *ns)
