@@ -2291,6 +2291,19 @@ static inline bool nvme_csi_has_nvm_support(NvmeNamespace *ns)
     return false;
 }
 
+static uint16_t nvme_rpt_empty_id_struct(NvmeCtrl *n, uint64_t prp1,
+    uint64_t prp2)
+{
+    static const int data_len = NVME_IDENTIFY_DATA_SIZE;
+    uint32_t *list;
+    uint16_t ret;
+
+    list = g_malloc0(data_len);
+    ret = nvme_dma_read_prp(n, (uint8_t *)list, data_len, prp1, prp2);
+    g_free(list);
+    return ret;
+}
+
 static uint16_t nvme_identify_ctrl(NvmeCtrl *n, NvmeIdentify *c)
 {
     uint64_t prp1 = le64_to_cpu(c->prp1);
@@ -2306,17 +2319,12 @@ static uint16_t nvme_identify_ctrl_csi(NvmeCtrl *n, NvmeIdentify *c)
 {
     uint64_t prp1 = le64_to_cpu(c->prp1);
     uint64_t prp2 = le64_to_cpu(c->prp2);
-    static const int data_len = NVME_IDENTIFY_DATA_SIZE;
-    uint32_t *list;
     uint16_t ret;
 
     trace_pci_nvme_identify_ctrl_csi(c->csi);
 
     if (c->csi == NVME_CSI_NVM) {
-        list = g_malloc0(data_len);
-        ret = nvme_dma_read_prp(n, (uint8_t *)list, data_len, prp1, prp2);
-        g_free(list);
-        return ret;
+        return nvme_rpt_empty_id_struct(n, prp1, prp2);
     } else if (c->csi == NVME_CSI_ZONED && n->params.zoned) {
         NvmeIdCtrlZoned *id = g_malloc0(sizeof(*id));
         id->zasl = n->zasl;
@@ -2334,9 +2342,6 @@ static uint16_t nvme_identify_ns(NvmeCtrl *n, NvmeIdentify *c, bool only_active)
     uint32_t nsid = le32_to_cpu(c->nsid);
     uint64_t prp1 = le64_to_cpu(c->prp1);
     uint64_t prp2 = le64_to_cpu(c->prp2);
-    static const int data_len = NVME_IDENTIFY_DATA_SIZE;
-    uint32_t *list;
-    uint16_t ret;
 
     trace_pci_nvme_identify_ns(nsid);
 
@@ -2349,10 +2354,7 @@ static uint16_t nvme_identify_ns(NvmeCtrl *n, NvmeIdentify *c, bool only_active)
     assert(nsid == ns->nsid);
 
     if (only_active && !ns->attached) {
-        list = g_malloc0(data_len);
-        ret = nvme_dma_read_prp(n, (uint8_t *)list, data_len, prp1, prp2);
-        g_free(list);
-        return ret;
+        return nvme_rpt_empty_id_struct(n, prp1, prp2);
     }
 
     if (c->csi == NVME_CSI_NVM && nvme_csi_has_nvm_support(ns)) {
@@ -2370,9 +2372,6 @@ static uint16_t nvme_identify_ns_csi(NvmeCtrl *n, NvmeIdentify *c,
     uint32_t nsid = le32_to_cpu(c->nsid);
     uint64_t prp1 = le64_to_cpu(c->prp1);
     uint64_t prp2 = le64_to_cpu(c->prp2);
-    static const int data_len = NVME_IDENTIFY_DATA_SIZE;
-    uint32_t *list;
-    uint16_t ret;
 
     trace_pci_nvme_identify_ns_csi(nsid, c->csi);
 
@@ -2385,17 +2384,11 @@ static uint16_t nvme_identify_ns_csi(NvmeCtrl *n, NvmeIdentify *c,
     assert(nsid == ns->nsid);
 
     if (only_active && !ns->attached) {
-        list = g_malloc0(data_len);
-        ret = nvme_dma_read_prp(n, (uint8_t *)list, data_len, prp1, prp2);
-        g_free(list);
-        return ret;
+        return nvme_rpt_empty_id_struct(n, prp1, prp2);
     }
 
     if (c->csi == NVME_CSI_NVM && nvme_csi_has_nvm_support(ns)) {
-        list = g_malloc0(data_len);
-        ret = nvme_dma_read_prp(n, (uint8_t *)list, data_len, prp1, prp2);
-        g_free(list);
-        return ret;
+        return nvme_rpt_empty_id_struct(n, prp1, prp2);
     } else if (c->csi == NVME_CSI_ZONED && ns->csi == NVME_CSI_ZONED) {
         return nvme_dma_read_prp(n, (uint8_t *)ns->id_ns_zoned,
                                  sizeof(*ns->id_ns_zoned), prp1, prp2);
