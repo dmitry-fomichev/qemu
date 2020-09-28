@@ -31,6 +31,7 @@
 static void nvme_ns_init(NvmeNamespace *ns)
 {
     NvmeIdNs *id_ns = &ns->id_ns;
+    int lba_index;
 
     if (blk_get_flags(ns->blkconf.blk) & BDRV_O_UNMAP) {
         ns->id_ns.dlfeat = 0x9;
@@ -43,6 +44,9 @@ static void nvme_ns_init(NvmeNamespace *ns)
     /* no thin provisioning */
     id_ns->ncap = id_ns->nsze;
     id_ns->nuse = id_ns->ncap;
+
+    lba_index = NVME_ID_NS_FLBAS_INDEX(ns->id_ns.flbas);
+    ns->id_ns.lbaf[lba_index].ds = 31 - clz32(ns->blkconf.logical_block_size);
 }
 
 static int nvme_ns_init_blk(NvmeCtrl *n, NvmeNamespace *ns, Error **errp)
