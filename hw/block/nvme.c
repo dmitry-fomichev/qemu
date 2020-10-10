@@ -1162,10 +1162,10 @@ typedef struct NvmeReadFillCtx {
     uint32_t  post_rd_fill_nlb;
 } NvmeReadFillCtx;
 
-static uint16_t nvme_check_zone_read(NvmeNamespace *ns, NvmeZone *zone,
-                                     uint64_t slba, uint32_t nlb,
-                                     NvmeReadFillCtx *rfc)
+static uint16_t nvme_check_zone_read(NvmeNamespace *ns, uint64_t slba,
+                                     uint32_t nlb, NvmeReadFillCtx *rfc)
 {
+    NvmeZone *zone = nvme_get_zone_by_slba(ns, slba);
     NvmeZone *next_zone;
     uint64_t bndry = nvme_zone_rd_boundary(ns, zone);
     uint64_t end = slba + nlb, wp1, wp2;
@@ -1449,6 +1449,86 @@ static uint16_t nvme_flush(NvmeCtrl *n, NvmeRequest *req)
     return NVME_NO_COMPLETE;
 }
 
+static uint16_t nvme_read(NvmeCtrl *n, NvmeRequest *req)
+{
+    NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
+    NvmeNamespace *ns = req->ns;
+    uint64_t slba = le64_to_cpu(rw->slba);
+    uint32_t nlb = (uint32_t)le16_to_cpu(rw->nlb) + 1;
+    uint32_t fill_len;
+    uint64_t data_size = nvme_l2b(ns, nlb);
+    uint64_t data_offset, fill_ofs;
+    NvmeReadFillCtx rfc;
+    BlockBackend *blk = ns->blkconf.blk;
+    uint16_t status;
+
+    trace_pci_nvme_read(nvme_cid(req), nvme_nsid(ns), nlb, data_size, slba);
+
+    status = nvme_check_mdts(n, data_size);
+    if (status) {
+        trace_pci_nvme_err_mdts(nvme_cid(req), data_size);
+        goto invalid;
+    }
+
+    status = nvme_check_bounds(n, ns, slba, nlb);
+    if (status) {
+        trace_pci_nvme_err_invalid_lba_range(slba, nlb, ns->id_ns.nsze);
+        goto invalid;
+    }
+
+    if (ns->params.zoned) {
+        status = nvme_check_zone_read(ns, slba, nlb, &rfc);
+        if (status != NVME_SUCCESS) {
+            trace_pci_nvme_err_zone_read_not_ok(slba, nlb, status);
+            goto invalid;
+        }
+    }
+
+    status = nvme_map_dptr(n, data_size, req);
+    if (status) {
+        goto invalid;
+    }
+
+    if (ns->params.zoned) {
+        if (rfc.pre_rd_fill_nlb) {
+            fill_ofs = nvme_l2b(ns, rfc.pre_rd_fill_slba - slba);
+            fill_len = nvme_l2b(ns, rfc.pre_rd_fill_nlb);
+            nvme_fill_read_data(req, fill_ofs, fill_len,
+                                n->params.fill_pattern);
+        }
+        if (!rfc.read_nlb) {
+            /* No backend I/O necessary, only needed to fill the buffer */
+            req->status = NVME_SUCCESS;
+            return NVME_SUCCESS;
+        }
+        if (rfc.post_rd_fill_nlb) {
+            req->fill_ofs = nvme_l2b(ns, rfc.post_rd_fill_slba - slba);
+            req->fill_len = nvme_l2b(ns, rfc.post_rd_fill_nlb);
+        } else {
+            req->fill_len = 0;
+        }
+        slba = rfc.read_slba;
+        data_size = nvme_l2b(ns, rfc.read_nlb);
+    }
+
+    data_offset = nvme_l2b(ns, slba);
+
+    block_acct_start(blk_get_stats(blk), &req->acct, data_size,
+                     BLOCK_ACCT_READ);
+    if (req->qsg.sg) {
+        req->aiocb = dma_blk_read(blk, &req->qsg, data_offset,
+                                  BDRV_SECTOR_SIZE, nvme_rw_cb, req);
+    } else {
+        req->aiocb = blk_aio_preadv(blk, data_offset, &req->iov, 0,
+                                    nvme_rw_cb, req);
+    }
+    return NVME_NO_COMPLETE;
+
+invalid:
+    block_acct_invalid(blk_get_stats(blk), BLOCK_ACCT_READ);
+    return status | NVME_DNR;
+}
+
 static uint16_t nvme_write_zeroes(NvmeCtrl *n, NvmeRequest *req)
 {
     NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
@@ -1495,25 +1575,20 @@ invalid:
     return status | NVME_DNR;
 }
 
-static uint16_t nvme_rw(NvmeCtrl *n, NvmeRequest *req, bool append)
+static uint16_t nvme_write(NvmeCtrl *n, NvmeRequest *req, bool append)
 {
     NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
     NvmeNamespace *ns = req->ns;
-    uint32_t nlb = (uint32_t)le16_to_cpu(rw->nlb) + 1;
     uint64_t slba = le64_to_cpu(rw->slba);
+    uint32_t nlb = (uint32_t)le16_to_cpu(rw->nlb) + 1;
     uint64_t data_size = nvme_l2b(ns, nlb);
-    uint64_t data_offset, fill_ofs;
-
+    uint64_t data_offset;
     NvmeZone *zone;
-    uint32_t fill_len;
-    NvmeReadFillCtx rfc;
-    bool is_write = rw->opcode == NVME_CMD_WRITE || append;
-    enum BlockAcctType acct = is_write ? BLOCK_ACCT_WRITE : BLOCK_ACCT_READ;
     BlockBackend *blk = ns->blkconf.blk;
     uint16_t status;
 
-    trace_pci_nvme_rw(nvme_cid(req), nvme_io_opc_str(rw->opcode),
-                      nvme_nsid(ns), nlb, data_size, slba);
+    trace_pci_nvme_write(nvme_cid(req), nvme_io_opc_str(rw->opcode),
+                         nvme_nsid(ns), nlb, data_size, slba);
 
     status = nvme_check_mdts(n, data_size);
     if (status) {
@@ -1530,29 +1605,21 @@ static uint16_t nvme_rw(NvmeCtrl *n, NvmeRequest *req, bool append)
     if (ns->params.zoned) {
         zone = nvme_get_zone_by_slba(ns, slba);
 
-        if (is_write) {
-            status = nvme_check_zone_write(n, ns, zone, slba, nlb, append);
-            if (status != NVME_SUCCESS) {
-                goto invalid;
-            }
-
-            if (append) {
-                slba = zone->w_ptr;
-            }
-
-            status = nvme_auto_open_zone(ns, zone);
-            if (status != NVME_SUCCESS) {
-                goto invalid;
-            }
-
-            req->cqe.result64 = nvme_advance_zone_wp(ns, zone, nlb);
-        } else {
-            status = nvme_check_zone_read(ns, zone, slba, nlb, &rfc);
-            if (status != NVME_SUCCESS) {
-                trace_pci_nvme_err_zone_read_not_ok(slba, nlb, status);
-                goto invalid;
-            }
+        status = nvme_check_zone_write(n, ns, zone, slba, nlb, append);
+        if (status != NVME_SUCCESS) {
+            goto invalid;
         }
+
+        status = nvme_auto_open_zone(ns, zone);
+        if (status != NVME_SUCCESS) {
+            goto invalid;
+        }
+
+        if (append) {
+            slba = zone->w_ptr;
+        }
+
+        req->cqe.result64 = nvme_advance_zone_wp(ns, zone, nlb);
     } else if (append) {
         trace_pci_nvme_err_invalid_opc(rw->opcode);
         status = NVME_INVALID_OPCODE;
@@ -1566,56 +1633,21 @@ static uint16_t nvme_rw(NvmeCtrl *n, NvmeRequest *req, bool append)
         goto invalid;
     }
 
-    if (ns->params.zoned) {
-        if (is_write) {
-            req->cqe.result64 = nvme_advance_zone_wp(ns, zone, nlb);
-        } else {
-            if (rfc.pre_rd_fill_nlb) {
-                fill_ofs = nvme_l2b(ns, rfc.pre_rd_fill_slba - slba);
-                fill_len = nvme_l2b(ns, rfc.pre_rd_fill_nlb);
-                nvme_fill_read_data(req, fill_ofs, fill_len,
-                                    n->params.fill_pattern);
-            }
-            if (!rfc.read_nlb) {
-                /* No backend I/O necessary, only needed to fill the buffer */
-                req->status = NVME_SUCCESS;
-                return NVME_SUCCESS;
-            }
-            if (rfc.post_rd_fill_nlb) {
-                req->fill_ofs = nvme_l2b(ns, rfc.post_rd_fill_slba - slba);
-                req->fill_len = nvme_l2b(ns, rfc.post_rd_fill_nlb);
-            } else {
-                req->fill_len = 0;
-            }
-            slba = rfc.read_slba;
-            data_size = nvme_l2b(ns, rfc.read_nlb);
-        }
-    }
-
     data_offset = nvme_l2b(ns, slba);
 
-    block_acct_start(blk_get_stats(blk), &req->acct, data_size, acct);
+    block_acct_start(blk_get_stats(blk), &req->acct, data_size,
+                     BLOCK_ACCT_WRITE);
     if (req->qsg.sg) {
-        if (is_write) {
-            req->aiocb = dma_blk_write(blk, &req->qsg, data_offset,
-                                       BDRV_SECTOR_SIZE, nvme_rw_cb, req);
-        } else {
-            req->aiocb = dma_blk_read(blk, &req->qsg, data_offset,
-                                      BDRV_SECTOR_SIZE, nvme_rw_cb, req);
-        }
+        req->aiocb = dma_blk_write(blk, &req->qsg, data_offset,
+                                   BDRV_SECTOR_SIZE, nvme_rw_cb, req);
     } else {
-        if (is_write) {
-            req->aiocb = blk_aio_pwritev(blk, data_offset, &req->iov, 0,
-                                         nvme_rw_cb, req);
-        } else {
-            req->aiocb = blk_aio_preadv(blk, data_offset, &req->iov, 0,
-                                        nvme_rw_cb, req);
-        }
+        req->aiocb = blk_aio_pwritev(blk, data_offset, &req->iov, 0,
+                                     nvme_rw_cb, req);
     }
     return NVME_NO_COMPLETE;
 
 invalid:
-    block_acct_invalid(blk_get_stats(blk), acct);
+    block_acct_invalid(blk_get_stats(blk), BLOCK_ACCT_WRITE);
     return status | NVME_DNR;
 }
 
@@ -2096,10 +2128,11 @@ static uint16_t nvme_io_cmd(NvmeCtrl *n, NvmeRequest *req)
     case NVME_CMD_WRITE_ZEROES:
         return nvme_write_zeroes(n, req);
     case NVME_CMD_ZONE_APPEND:
-        return nvme_rw(n, req, true);
+        return nvme_write(n, req, true);
     case NVME_CMD_WRITE:
+        return nvme_write(n, req, false);
     case NVME_CMD_READ:
-        return nvme_rw(n, req, false);
+        return nvme_read(n, req);
     case NVME_CMD_ZONE_MGMT_SEND:
         return nvme_zone_mgmt_send(n, req);
     case NVME_CMD_ZONE_MGMT_RECV:
