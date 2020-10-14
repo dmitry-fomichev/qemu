@@ -33,9 +33,7 @@ static void nvme_ns_init(NvmeNamespace *ns)
     NvmeIdNs *id_ns = &ns->id_ns;
     int lba_index;
 
-    if (blk_get_flags(ns->blkconf.blk) & BDRV_O_UNMAP) {
-        ns->id_ns.dlfeat = 0x9;
-    }
+    ns->id_ns.dlfeat = 0x9;
 
     id_ns->lbaf[0].ds = BDRV_SECTOR_BITS;
 
@@ -47,6 +45,9 @@ static void nvme_ns_init(NvmeNamespace *ns)
 
     lba_index = NVME_ID_NS_FLBAS_INDEX(ns->id_ns.flbas);
     ns->id_ns.lbaf[lba_index].ds = 31 - clz32(ns->blkconf.logical_block_size);
+
+    /* support DULBE */
+    id_ns->nsfeat |= 0x4;
 }
 
 static int nvme_ns_init_blk(NvmeCtrl *n, NvmeNamespace *ns, Error **errp)
@@ -95,6 +96,7 @@ int nvme_ns_setup(NvmeCtrl *n, NvmeNamespace *ns, Error **errp)
     }
 
     nvme_ns_init(ns);
+
     if (nvme_register_namespace(n, ns, errp)) {
         return -1;
     }
