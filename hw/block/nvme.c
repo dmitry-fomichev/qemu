@@ -1138,13 +1138,8 @@ static uint16_t nvme_check_zone_write(NvmeCtrl *n, NvmeNamespace *ns,
     uint64_t bndry = nvme_zone_wr_boundary(zone);
     uint16_t status;
 
-    if (unlikely(slba + nlb > bndry)) {
-        status = NVME_ZONE_BOUNDARY_ERROR;
-    } else {
-        status = nvme_check_zone_state_for_write(zone);
-    }
-
-    if (status != NVME_SUCCESS) {
+    status = nvme_check_zone_state_for_write(zone);
+    if (status) {
         trace_pci_nvme_err_zone_write_not_ok(slba, nlb, status);
     } else {
         assert(nvme_wp_is_valid(zone));
@@ -1158,10 +1153,14 @@ static uint16_t nvme_check_zone_write(NvmeCtrl *n, NvmeNamespace *ns,
                 trace_pci_nvme_err_append_too_large(slba, nlb, n->zasl);
                 status = NVME_INVALID_FIELD;
             }
-        } else if (unlikely(slba != zone->w_ptr)) {
-            trace_pci_nvme_err_write_not_at_wp(slba, zone->d.zslba,
-                                               zone->w_ptr);
-            status = NVME_ZONE_INVALID_WRITE;
+        } else {
+            if (unlikely(slba != zone->w_ptr)) {
+                trace_pci_nvme_err_write_not_at_wp(slba, zone->d.zslba,
+                                                   zone->w_ptr);
+                status = NVME_ZONE_INVALID_WRITE;
+            } else if (unlikely(slba + nlb > bndry)) {
+                status = NVME_ZONE_BOUNDARY_ERROR;
+            }
         }
     }
 
