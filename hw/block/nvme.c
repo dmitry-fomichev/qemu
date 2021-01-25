@@ -1148,6 +1148,8 @@ static uint16_t nvme_check_zone_write(NvmeCtrl *n, NvmeNamespace *ns,
                 trace_pci_nvme_err_append_not_at_start(slba, zone->d.zslba);
                 status = NVME_INVALID_FIELD;
             } else if (unlikely(zone->w_ptr + nlb > bndry)) {
+                trace_pci_nvme_err_append_across_boundary(slba, nlb,
+                                                          zone->w_ptr, bndry);
                 status = NVME_ZONE_BOUNDARY_ERROR;
             } else if (nvme_l2b(ns, nlb) > (n->page_size << n->zasl)) {
                 trace_pci_nvme_err_append_too_large(slba, nlb, n->zasl);
@@ -1159,6 +1161,7 @@ static uint16_t nvme_check_zone_write(NvmeCtrl *n, NvmeNamespace *ns,
                                                    zone->w_ptr);
                 status = NVME_ZONE_INVALID_WRITE;
             } else if (unlikely(slba + nlb > bndry)) {
+                trace_pci_nvme_err_write_across_boundary(slba, nlb, bndry);
                 status = NVME_ZONE_BOUNDARY_ERROR;
             }
         }
@@ -1200,9 +1203,10 @@ static uint16_t nvme_check_zone_read(NvmeNamespace *ns, uint64_t slba,
 
     status = nvme_check_zone_state_for_read(zone);
     if (status != NVME_SUCCESS) {
-        ;
+        trace_pci_nvme_err_zone_read_not_ok(slba, nlb, status);
     } else if (unlikely(end > bndry)) {
         if (!ns->params.cross_zone_read) {
+            trace_pci_nvme_err_read_across_boundary(slba, nlb, bndry);
             status = NVME_ZONE_BOUNDARY_ERROR;
         } else {
             /*
@@ -1213,6 +1217,7 @@ static uint16_t nvme_check_zone_read(NvmeNamespace *ns, uint64_t slba,
                 zone++;
                 status = nvme_check_zone_state_for_read(zone);
                 if (status != NVME_SUCCESS) {
+                    trace_pci_nvme_err_zone_read_not_ok(slba, nlb, status);
                     break;
                 }
             } while (end > nvme_zone_rd_boundary(ns, zone));
@@ -1624,7 +1629,6 @@ static uint16_t nvme_read(NvmeCtrl *n, NvmeRequest *req)
     if (ns->params.zoned) {
         status = nvme_check_zone_read(ns, slba, nlb);
         if (status != NVME_SUCCESS) {
-            trace_pci_nvme_err_zone_read_not_ok(slba, nlb, status);
             goto invalid;
         }
     }
